@@ -666,7 +666,7 @@ class ProtectionManager:
             reason = f"Restoring protection by [[User:{user}|{user}]]: {comment}"
             logging.info(f"protecting: {expired_title} | {protections} | {restore_edit_expiry} | {restore_move_expiry} | expiry = {expiry} | {reason}")
             if not DRY_RUN:
-                pywikibot.protect(page, protections, reason, expiry=expiry)
+                self.site.protect(page, protections, reason, expiry=expiry)
             return True
 
         # conditions not met
