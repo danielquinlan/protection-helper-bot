@@ -39,6 +39,7 @@ from datetime import datetime, timedelta
 DAYS_TO_CHECK = timedelta(days=180) # number of days of logs to review
 PROTECTION_DURATION_THRESHOLD = timedelta(days=90) # skip protections applied for longer than this
 RECENT_INTERVAL = timedelta(days=180) # act on protections that have expired during this period
+DRY_RUN = os.getenv('REPROTECT_DRY_RUN', 'true').lower() != 'false' # no actions by default
 
 
 # timezone and logging
@@ -377,9 +378,7 @@ class ProtectionManager:
             except Exception as e:
                 logging.error(f"error processing log entry for {log}: {e}")
 
-        print(f"total logs: {count}")
-        print(f"expirations: {len(self.pages)}")
-        #print(f"expirations: {self.pages}")
+        logging.info(f"total logs: {count}, expirations: {len(self.pages)}")
 
     def next_expired_protection(self):
         """
@@ -551,10 +550,13 @@ class ProtectionManager:
             try:
                 if index == 0:
                     if logid != expired_logid:
-                        logging.info(f"skipping due to more recent protection: {expired_title} | {protections}")
+                        logging.info(f"skipping due to more recent protection: {expired_title}")
                         return False
                     if not details:
-                        logging.error(f"skipping due to no details for expired protection: {expired_title} | {protections}")
+                        logging.error(f"skipping due to no details for expired protection: {expired_title}")
+                        return False
+                    if self.site.username() == log['user']:
+                        logging.warning(f"skipping due to most recent protection from self: {expired_title}")
                         return False
                     for detail in details:
                         detail_type = detail.get('type', None)
@@ -571,10 +573,10 @@ class ProtectionManager:
                             return False
                 elif index == 1:
                     if action not in ['modify', 'protect']:
-                        logging.info(f"skipping due to previous non-protection: {action} | {expired_title} | {protections} | {log}")
+                        logging.info(f"skipping due to previous non-protection: {action} | {expired_title} | {log}")
                         return False
                     if not details:
-                        logging.error(f"skipping due to no details for previous protection: {expired_title} | {protections}")
+                        logging.error(f"skipping due to no details for previous protection: {expired_title}")
                         return False
 
                     # details for the reason
@@ -663,6 +665,8 @@ class ProtectionManager:
                 expiry = restore_move_expiry
             reason = f"Restoring protection by [[User:{user}|{user}]]: {comment}"
             logging.info(f"protecting: {expired_title} | {protections} | {restore_edit_expiry} | {restore_move_expiry} | expiry = {expiry} | {reason}")
+            if not DRY_RUN:
+                pywikibot.protect(page, protections, reason, expiry=expiry)
             return True
 
         # conditions not met
