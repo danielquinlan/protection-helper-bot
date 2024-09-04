@@ -12,7 +12,6 @@ Functionality:
 - Log protection changes with the appropriate reason and attribution.
 
 No reprotection action is taken in the following cases:
-- The higher protection duration was PROTECTION_DURATION_THRESHOLD days or longer.
 - The duration of the higher protection level extends beyond the prior protection's expiration.
 - The protection level is the same as or lower than the previous level.
 - There is a more recent protection action.
@@ -37,8 +36,7 @@ from datetime import datetime, timedelta
 
 # configuration
 DAYS_TO_CHECK = timedelta(days=180) # number of days of logs to review
-PROTECTION_DURATION_THRESHOLD = timedelta(days=90) # skip protections applied for longer than this
-RECENT_INTERVAL = timedelta(days=180) # act on protections that have expired during this period
+RECENT_INTERVAL = timedelta(days=90) # act on protections that have expired during this period
 DRY_RUN = os.getenv('REPROTECT_DRY_RUN', 'true').lower() != 'false' # no actions by default
 
 
@@ -324,7 +322,7 @@ class ProtectionManager:
             # unprotection
             if log['action'] == 'unprotect':
                 if title in self.pages:
-                    logging.debug(f"unprotected {title}")
+                    logging.debug(f"unprotect action on {title}")
                 self.pages.pop(title, None)
                 continue
 
@@ -521,6 +519,11 @@ class ProtectionManager:
                 logging.info(f"move result: {expired_title} | {move_result}")
         except Exception as e:
             logging.warning(f"error following moves for {expired_title}: {e}")
+
+        # deleted pages
+        if not page.exists():
+            logging.info(f"skipping due to page not existing: {expired_title}")
+            return False
 
         edit_level = None
         edit_expiry = None
