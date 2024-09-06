@@ -23,6 +23,7 @@ Non-standard dependencies:
 - pywikibot: For interacting with MediaWiki.
 """
 
+import argparse
 import logging
 import os
 import pywikibot
@@ -35,8 +36,8 @@ from datetime import datetime, timedelta
 
 
 # configuration
-DAYS_TO_CHECK = timedelta(days=180) # number of days of logs to review
-RECENT_INTERVAL = timedelta(days=90) # act on protections that have expired during this period
+LOOKBACK_INTERVAL = timedelta(days=366) # log period to review
+RECENT_INTERVAL = timedelta(days=90) # act on protections that have expired within this period
 DRY_RUN = os.getenv('REPROTECT_DRY_RUN', 'true').lower() != 'false' # no actions by default
 
 
@@ -46,6 +47,40 @@ time.tzset()
 logging.basicConfig(format='%(asctime)s | %(levelname)s | %(funcName)s | %(message)s',
                     datefmt='%Y-%m-%dT%H:%M:%S',
                     level=getattr(logging, os.getenv('LOG_LEVEL', 'INFO').upper(), logging.INFO))
+
+
+def parse_args():
+    """
+    Parse command-line arguments for the Protection Manager script.
+
+    Returns:
+    namespace (argparse.Namespace): Parsed arguments including the --future option.
+    """
+    parser = argparse.ArgumentParser(description="Protection Manager Script")
+    parser.add_argument('--future', type=int, help="Number of days in the future to simulate")
+
+    # not suitable for running in production
+    assert DRY_RUN, "--future option should only be used in dry runs"
+
+    return parser.parse_args()
+
+
+def login():
+    """
+    Authenticate on the MediaWiki site and return the site object.
+
+    Returns:
+    site (pywikibot.Site): The MediaWiki site to monitor.
+    """
+    site = pywikibot.Site()
+    site.login()
+    if site.userinfo['name'] == site.username():
+        logging.info(f"successfully logged in as {site.username()}")
+        return site
+    else:
+        logging.error("login failed")
+        time.sleep(300)
+        sys.exit(1)
 
 
 class ProtectionFunctions:
@@ -102,9 +137,9 @@ class ProtectionLogs:
         site (pywikibot.Site): The site from which to retrieve logs.
         """
         self.site = site
-        self.next_fetch_time = datetime.now() - DAYS_TO_CHECK
+        self.next_fetch_time = datetime.now() - LOOKBACK_INTERVAL
 
-    def all_logs(self):
+    def fetch_all_logs(self):
         """
         Retrieve all protection logs within the configured date range.
 
@@ -121,7 +156,7 @@ class ProtectionLogs:
                 yield log_result
         return
 
-    def page_logs(self, page=None, before=None):
+    def fetch_page_logs(self, page=None, before=None):
         """
         Retrieve protection logs for a specific page.
 
@@ -146,11 +181,11 @@ class ProtectionLogs:
             if log_data['action'] == 'move_prot':
                 # switch to the old title and yield logs for it
                 logging.debug(f"switching to old title: {details}")
-                yield from self.page_logs(page=details, before=log_data['logid'])
+                yield from self.fetch_page_logs(page=details, before=log_data['logid'])
             else:
                 yield log_result
 
-    def validate_log_data(self, log_data):
+    def is_log_data_valid(self, log_data):
         """
         Validate the structure and types of log data.
 
@@ -166,7 +201,8 @@ class ProtectionLogs:
             'action': str,
             'params': dict,
             'user': str,
-            'comment': str
+            'comment': str,
+            'timestamp': str
         }
 
         # check for missing or incorrect type for required keys
@@ -179,6 +215,55 @@ class ProtectionLogs:
                 return False
 
         return True
+
+    def extract_legacy_protection_details(self, description):
+        """
+        Extracts details from a legacy protection description.
+
+        Parameters:
+        description (str): The protection description text to parse.
+
+        Returns:
+        list: A list of dictionaries containing extracted details, where each dictionary includes:
+            - 'type': The type of protection.
+            - 'level': The protection level.
+            - 'expiry': The expiry timestamp of the protection or float('inf') for indefinite.
+        None: If no details could be extracted, or the type of protection isn't 'edit' or 'move'.
+        """
+        level_map = {
+            'Block new and unregistered users': 'autoconfirmed',
+            'Block all non-admin users': 'sysop'
+        }
+        patterns = [
+            r'\[(?P<type>edit|move)=(?P<level>\w+)\] \((?P<expiry>expires[^\)]+\(UTC\)|indefinite)\)',
+            r'\[(?P<type>Edit|Move)=(?P<level>Block new and unregistered users|Block all non-admin users)\] \((?P<expiry>expires[^\)]+\(UTC\)|indefinite)\)'
+        ]
+        details = []
+
+        for pattern in patterns:
+            for match in re.finditer(pattern, description):
+                expiry = match.group('expiry')
+                if expiry == 'indefinite':
+                    expiry = float('inf')
+                else:
+                    expiry = datetime.strptime(expiry, 'expires %H:%M, %d %B %Y (UTC)').timestamp()
+
+                level = match.group('level')
+                if level in level_map:
+                    level = level_map[level]
+                if ProtectionFunctions.protection_level(level) == -1:
+                    continue
+
+                details.append({
+                    'type': match.group('type').lower(),
+                    'level': level,
+                    'expiry': expiry
+                })
+
+            if details:
+                return details
+
+        return None
 
     def parse_log(self, log):
         """
@@ -200,11 +285,11 @@ class ProtectionLogs:
             if not log_data:
                 logging.error(f"no data in log: {vars(log)}")
                 return None
-            if 'actionhidden' in log_data or 'commenthidden' in log_data:
+            if any(field in log_data for field in ['actionhidden', 'commenthidden', 'suppressed', 'userhidden']):
                 logging.debug(f"hidden log: {vars(log)}")
                 return None
             # validate log_data
-            if not self.validate_log_data(log_data):
+            if not self.is_log_data_valid(log_data):
                 return None
         except Exception as e:
             logging.error(f"error processing log: {e}")
@@ -218,10 +303,10 @@ class ProtectionLogs:
         # check details and parse expiry
         params = log_data.get('params', None)
         if not params:
-            # ancient log format, only parse if indefinite
+            # ancient log format, only parse if indefinite (2005-12-22 to 2008-12-25)
             if action == 'protect' and isinstance(params, dict):
                 comment = log_data.get('comment', '')
-                m = re.search(r' \[(edit|move)=(\w+)\]$| \[edit=(\w+):move=(\w+)\]$', comment)
+                m = re.search(r'(?:^| )\[(edit|move)=(\w+)\]$|(?:^| )\[edit=(\w+):move=(\w+)\]$', comment)
                 if m:
                     if m.group(1):
                         details = [
@@ -232,7 +317,7 @@ class ProtectionLogs:
                             {'type': 'edit', 'level': m.group(3), 'expiry': float('inf')},
                             {'type': 'move', 'level': m.group(4), 'expiry': float('inf')}
                         ]
-                    logging.debug(f"parsed ancient log: {details} | {vars(log)}")
+                    logging.info(f"parsed ancient log: {details} | {vars(log)}")
                     return log_data, details
             logging.info(f"missing params: {vars(log)}")
             return None
@@ -245,38 +330,26 @@ class ProtectionLogs:
             logging.error(f"move_prot missing oldtitle_title: {vars(log)}")
             return None
 
-        # legacy or recent protection
+        # legacy log formats (2008-09-20 to 2015-10-01)
         details = params.get('details', None)
         if not details:
-            # legacy log format
-            description = params.get('description', None)
-            if description:
-                try:
-                    pattern = r'\[(?P<type>edit|move)=(?P<level>\w+)\] \((?P<expiry>expires[^\)]+\(UTC\)|indefinite)\)'
-                    details = []
+            try:
+                description = params.get('description', None)
+                if description:
+                    extracted_details = self.extract_legacy_protection_details(description)
+                    if extracted_details:
+                        logging.info(f"parsed legacy log: {log_data['logid']} | {log_data['title']} | {extracted_details} | {vars(log)}")
+                        return log_data, extracted_details
+            except Exception as e:
+                logging.error(f"error parsing legacy log: {e} | {vars(log)}")
+                return None
 
-                    for match in re.finditer(pattern, description):
-                        expiry = match.group('expiry')
-                        if expiry == 'indefinite':
-                            expiry = float('inf')
-                        else:
-                            expiry = datetime.strptime(expiry, 'expires %H:%M, %d %B %Y (UTC)').timestamp()
-                        details.append({
-                            'type': match.group('type'),
-                            'level': match.group('level'),
-                            'expiry': expiry
-                        })
-                    logging.debug(f"parsed legacy log: {log_data['logid']} | {log_data['title']} | {details} | {vars(log)}")
-                    return log_data, details
-                except Exception as e:
-                    logging.error(f"error parsing legacy log: {e}")
-                    return None
-
-        # recent protection
+        # this is almost entirely legacy formatted create and upload protections
         if not isinstance(details, list):
-            logging.error(f"missing log details: {vars(log)}")
+            logging.warning(f"missing log details: {vars(log)}")
             return None
 
+        # recent protection (after 2015-10-01)
         for detail in details:
             detail_type = detail.get('type', None)
             detail_level = detail.get('level', None)
@@ -304,7 +377,7 @@ class ProtectionManager:
     Class to manage and restore protection settings based on logs.
     """
 
-    def __init__(self, site):
+    def __init__(self, site, future_days=None):
         """
         Initialize the ProtectionManager instance.
 
@@ -312,10 +385,11 @@ class ProtectionManager:
         site (pywikibot.Site): The site on which to manage protections.
         """
         self.site = site
+        self.future_time = timedelta(days=future_days).total_seconds() if future_days else 0
         self.logs = ProtectionLogs(site)
-        self.pages = {}
+        self.page_protections = {}
 
-    def protection_expirations(self):
+    def update_page_protections(self):
         """
         Process all protection logs and update the internal list of pages with active protections.
 
@@ -323,22 +397,22 @@ class ProtectionManager:
         the list of pages with active protections based on their expiration timestamps.
         """
         count = 0
-        for (log, details) in self.logs.all_logs():
+        for (log, details) in self.logs.fetch_all_logs():
             count += 1
             title = log['title']
 
             # unprotection
             if log['action'] == 'unprotect':
-                if title in self.pages:
+                if title in self.page_protections:
                     logging.debug(f"unprotect action on {title}")
-                self.pages.pop(title, None)
+                self.page_protections.pop(title, None)
                 continue
 
-            # moved protection settings
+            # moved protection settings (details is the old title)
             if log['action'] == 'move_prot':
-                if details in self.pages:
-                    logging.debug(f"moved protection from {details} to {title}: {self.pages.get(details)}")
-                    self.pages[title] = self.pages.pop(details)
+                if details in self.page_protections:
+                    logging.debug(f"moved protection from {details} to {title}: {self.page_protections.get(details)}")
+                    self.page_protections[title] = self.page_protections.pop(details)
                 continue
 
             # protection
@@ -380,13 +454,13 @@ class ProtectionManager:
                     continue
                 # store expirations
                 if filtered_details:
-                    self.pages[title] = (log['logid'], filtered_details)
+                    self.page_protections[title] = (log['logid'], filtered_details)
             except Exception as e:
                 logging.error(f"error processing log entry for {log}: {e}")
 
-        logging.info(f"total logs: {count}, expirations: {len(self.pages)}")
+        logging.info(f"total logs: {count}, expirations: {len(self.page_protections)}")
 
-    def next_expired_protection(self):
+    def find_next_expired_protection(self):
         """
         Finds the page with the oldest expired protection.
 
@@ -399,7 +473,7 @@ class ProtectionManager:
         oldest_expiry = float('inf')
         oldest_page = None
 
-        for title, (logid, protections) in self.pages.items():
+        for title, (logid, protections) in self.page_protections.items():
             expiry_timestamps = set()
             for protection in protections:
                 expiry = protection.get('expiry', None)
@@ -408,19 +482,19 @@ class ProtectionManager:
                     continue
                 expiry_timestamps.add(expiry)
                 # expire based on the edit timestamp if there are two different timestamps
-                if expiry < oldest_expiry and expiry < time.time() and (not oldest_page or protection.get('type', None) == 'edit'):
+                if expiry < oldest_expiry and expiry < time.time() + self.future_time and (not oldest_page or protection.get('type', None) == 'edit'):
                     oldest_expiry = expiry
                     oldest_page = title
 
             if len(expiry_timestamps) > 1:
                 logging.debug(f"multiple expiry timestamps for {title}: {max(expiry_timestamps) - min(expiry_timestamps)} {protections}")
 
-        logging.info(f"oldest: {oldest_page} {oldest_expiry} {self.pages.get(oldest_page)}")
+        logging.info(f"oldest: {oldest_page} {oldest_expiry} {self.page_protections.get(oldest_page)}")
         return oldest_page
 
-    def restore_protection(self, expired_title):
+    def evaluate_protection_restoration(self, expired_title):
         """
-        Restores protection for a page if expired protection can be restored.
+        Restores protection for a page if expired protection should be restored.
 
         Attempts to restore the protection level of a page based on the logs and compares
         with previous protection details.
@@ -431,7 +505,7 @@ class ProtectionManager:
         Returns:
         bool: True if protection restored, False otherwise.
         """
-        expired_logid, protections = self.pages.pop(expired_title)
+        expired_logid, protections = self.page_protections.pop(expired_title)
         page = pywikibot.Page(self.site, expired_title)
 
         # deleted pages
@@ -451,7 +525,7 @@ class ProtectionManager:
         found_expired_logid = False
         user = None
 
-        for index, (log, details) in enumerate(self.logs.page_logs(page=page)):
+        for index, (log, details) in enumerate(self.logs.fetch_page_logs(page=page)):
             logid = log['logid']
             title = log['title']
             action = log['action']
@@ -590,31 +664,28 @@ class ProtectionManager:
         logging.info(f"skipping due to conditions being unmet: {expired_title}");
         return False
 
+
 if __name__ == "__main__":
-    # initialize site and login
-    site = pywikibot.Site('en', 'wikipedia')
-    site.login()
-    if site.userinfo['name'] == site.username():
-        logging.info(f"successfully logged in as {site.username()}")
-    else:
-        logging.error("login failed")
+    try:
+        args = parse_args()
+        site = login()
+        manager = ProtectionManager(site, future_days=args.future)
+
+        # handle protection expirations
+        while True:
+            # fetch expirations
+            manager.update_page_protections()
+            # process all available expirations
+            while expired := manager.find_next_expired_protection():
+                if manager.evaluate_protection_restoration(expired):
+                    # longer wait between reprotection actions
+                    time.sleep(1 if DRY_RUN else 300)
+                else:
+                    # shorter wait otherwise
+                    time.sleep(1)
+            # wait before checking log again
+            time.sleep(300)
+    except Exception as e:
+        logging.error(f"unhandled exception: {e}")
         time.sleep(300)
         sys.exit(1)
-
-    # create protection manager instance
-    manager = ProtectionManager(site)
-
-    # handle protection expirations
-    while True:
-        # fetch expirations
-        manager.protection_expirations()
-        # process all available expirations
-        while expired := manager.next_expired_protection():
-            if manager.restore_protection(expired):
-                # longer wait between reprotection actions
-                time.sleep(300)
-            else:
-                # shorter wait otherwise
-                time.sleep(1)
-        # wait before checking log again
-        time.sleep(300)
