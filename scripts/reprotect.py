@@ -48,20 +48,45 @@ logging.basicConfig(format='%(asctime)s | %(levelname)s | %(funcName)s | %(messa
                     level=getattr(logging, os.getenv('LOG_LEVEL', 'INFO').upper(), logging.INFO))
 
 
-def iso_to_timestamp(iso_string):
+class ProtectionFunctions:
     """
-    Convert an ISO 8601 date-time string to a UNIX timestamp.
-
-    Parameters:
-    iso_string (str): The ISO 8601 date-time string (e.g., '2025-03-02T05:30:26Z').
-
-    Returns:
-    float: The corresponding UNIX timestamp.
+    Utility class for general functions used across protection-related classes.
     """
-    # Parse the ISO 8601 string into a datetime object
-    dt = datetime.fromisoformat(iso_string.replace("Z", "+00:00"))
-    # Convert the datetime object to a UNIX timestamp
-    return dt.timestamp()
+
+    @staticmethod
+    def iso_to_timestamp(iso_string):
+        """
+        Convert an ISO 8601 date-time string to a UNIX timestamp.
+
+        Parameters:
+        iso_string (str): The ISO 8601 date-time string (e.g., '2025-03-02T05:30:26Z').
+
+        Returns:
+        float: The corresponding UNIX timestamp.
+        """
+        # Parse the ISO 8601 string into a datetime object
+        dt = datetime.fromisoformat(iso_string.replace("Z", "+00:00"))
+        # Convert the datetime object to a UNIX timestamp
+        return dt.timestamp()
+
+
+    @staticmethod
+    def protection_level(level):
+        """
+        Map a protection level name to its integer representation.
+
+        Parameters:
+        level (str): The protection level name (e.g., 'autoconfirmed').
+
+        Returns:
+        int: The integer representation of the protection level.
+
+        Notes:
+        Verified for English Wikipedia only.
+        """
+        levels = {'autoconfirmed': 0, 'extendedconfirmed': 1, 'templateeditor': 2, 'sysop': 3}
+
+        return levels.get(level, -1)
 
 
 class ProtectionLogs:
@@ -266,7 +291,7 @@ class ProtectionLogs:
                 detail['expiry'] = float('inf')
             else:
                 try:
-                    detail['expiry'] = iso_to_timestamp(detail_expiry)
+                    detail['expiry'] = ProtectionFunctions.iso_to_timestamp(detail_expiry)
                 except Exception as e:
                     logging.error(f"error parsing expiry for {vars(log)}: {e}")
                     return None
@@ -289,23 +314,6 @@ class ProtectionManager:
         self.site = site
         self.logs = ProtectionLogs(site)
         self.pages = {}
-
-    def protection_level(self, level):
-        """
-        Map a protection level name to its integer representation.
-
-        Parameters:
-        level (str): The protection level name (e.g., 'autoconfirmed').
-
-        Returns:
-        int: The integer representation of the protection level.
-
-        Notes:
-        Verified for English Wikipedia only.
-        """
-        levels = {'autoconfirmed': 0, 'extendedconfirmed': 1, 'templateeditor': 2, 'sysop': 3}
-
-        return levels.get(level, -1)
 
     def protection_expirations(self):
         """
@@ -410,93 +418,6 @@ class ProtectionManager:
         logging.info(f"oldest: {oldest_page} {oldest_expiry} {self.pages.get(oldest_page)}")
         return oldest_page
 
-    def follow_moves(self, current_page, previous_logid):
-        """
-        Tracks the page through subsequent moves based on log entries.
-
-        Follows the page across moves to find its current location. Stops if no more moves are
-        found or if the maximum number of loops is exceeded.
-
-        Parameters:
-        current_page (str): The current title of the page.
-        previous_logid (int): The log ID of the last known move.
-
-        Returns:
-        str: Current title of the page after following moves, or None if no further moves are found.
-        """
-        original_page = current_page
-        loop_count = 0
-        max_loops = 100
-
-        while True:
-            # avoid looping forever
-            loop_count += 1
-            if loop_count > max_loops:
-                raise RuntimeError(f"Exceeded maximum number of loops ({max_loops}) while trying to follow moves from {original_page}.")
-
-            found_move = False
-            for log in self.site.logevents(logtype='move', page=current_page, reverse=True):
-                log_data = getattr(log, 'data', None)
-                if not log_data or 'params' not in log_data:
-                    logging.error(f"malformed move log entry: {vars(log)}")
-                    return None
-
-                logid = log_data.get('logid', None)
-                if logid > previous_logid:
-                    logging.debug(f"page {current_page} was moved after expired protection action {vars(log)}")
-                    # verify if the move matches the expected comment and user
-                    verify = self.verify_move(log_data)
-                    if verify:
-                        logging.debug(f"verified page {current_page} was moved after expired protection action {vars(log)}")
-                        current_page = verify
-                        previous_logid = logid
-                        found_move = True
-                        break
-
-            if not found_move:
-                if original_page == current_page:
-                    return None
-                else:
-                    logging.debug(f"no further confirmed moves for page {current_page}")
-                    return current_page
-
-    def verify_move(self, move_log_data):
-        """
-        Verifies if a move log entry corresponds to a valid move.
-
-        Checks if the move log entry matches with a protection log entry.
-        Returns the target title if verified.
-
-        Parameters:
-        move_log_data (dict): The log data of the move.
-
-        Returns:
-        str: The target title of the move if verified, otherwise None.
-        """
-        logid = move_log_data.get('logid', '')
-        comment = move_log_data.get('comment', '')
-        user = move_log_data.get('user', '')
-        target_title = move_log_data.get('params', {}).get('target_title', None)
-
-        if not logid or not comment or not user or not target_title:
-            logging.error(f"move log entry missing fields: {move_log_data}")
-            return None
-
-        for log in self.site.logevents(logtype='protect', page=target_title, reverse=True):
-            protect_log_data = getattr(log, 'data', None)
-            if not protect_log_data:
-                return None
-            protect_comment = protect_log_data.get('comment', '')
-            protect_user = protect_log_data.get('user', '')
-            protect_logid = protect_log_data.get('logid', None)
-            protect_action = protect_log_data.get('action', None)
-            logging.debug(f"move here {logid} {comment} {user} {target_title} | {protect_logid} {protect_comment} {protect_user} {protect_action}")
-            if comment in protect_comment and user == protect_user and abs(protect_logid - logid) < 10 and protect_action == 'move_prot':
-                logging.debug(f"verified move to {target_title} {abs(protect_logid - logid)}: {move_log_data} *** {protect_log_data}")
-                return target_title
-
-        return None
-
     def restore_protection(self, expired_title):
         """
         Restores protection for a page if expired protection can be restored.
@@ -512,13 +433,6 @@ class ProtectionManager:
         """
         expired_logid, protections = self.pages.pop(expired_title)
         page = pywikibot.Page(self.site, expired_title)
-
-        try:
-            move_result = self.follow_moves(expired_title, expired_logid)
-            if move_result:
-                logging.info(f"move result: {expired_title} | {move_result}")
-        except Exception as e:
-            logging.warning(f"error following moves for {expired_title}: {e}")
 
         # deleted pages
         if not page.exists():
@@ -624,9 +538,9 @@ class ProtectionManager:
         # convert timestamps
         try:
             if isinstance(restore_edit_expiry, str) and restore_edit_expiry[0].isdigit():
-                restore_edit_expiry = iso_to_timestamp(restore_edit_expiry)
+                restore_edit_expiry = ProtectionFunctions.iso_to_timestamp(restore_edit_expiry)
             if isinstance(restore_move_expiry, str) and restore_move_expiry[0].isdigit():
-                restore_move_expiry = iso_to_timestamp(restore_move_expiry)
+                restore_move_expiry = ProtectionFunctions.iso_to_timestamp(restore_move_expiry)
         except Exception as e:
             logging.error(f"skipping due to error converting protection timestamps: {current_protection} | {e}")
             return False
@@ -637,11 +551,11 @@ class ProtectionManager:
             return False
 
         # restoration logic
-        if previous_edit_level and self.protection_level(previous_edit_level) < self.protection_level(edit_level) and previous_edit_expiry > edit_expiry and previous_edit_expiry > time.time() + 3600:
+        if previous_edit_level and ProtectionFunctions.protection_level(previous_edit_level) < ProtectionFunctions.protection_level(edit_level) and previous_edit_expiry > edit_expiry and previous_edit_expiry > time.time() + 3600:
             restore_edit_level = previous_edit_level
             restore_edit_expiry = previous_edit_expiry
             reprotect = True
-        if previous_move_level and self.protection_level(previous_move_level) < self.protection_level(move_level) and previous_move_expiry > move_expiry and previous_move_expiry > time.time() + 3600 and previous_move_level != "autoconfirmed":
+        if previous_move_level and ProtectionFunctions.protection_level(previous_move_level) < ProtectionFunctions.protection_level(move_level) and previous_move_expiry > move_expiry and previous_move_expiry > time.time() + 3600 and previous_move_level != "autoconfirmed":
             restore_move_level = previous_move_level
             restore_move_expiry = previous_move_expiry
             reprotect = True
