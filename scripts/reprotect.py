@@ -729,6 +729,9 @@ if __name__ == "__main__":
         site = login()
         manager = ProtectionManager(site, backtest=args.backtest, future_days=args.future)
 
+        # log various options for debugging
+        logging.info(f"starting: DRY_RUN={DRY_RUN} | LOOKBACK_INTERVAL={LOOKBACK_INTERVAL} | RECENT_INTERVAL={RECENT_INTERVAL} | args={args}")
+
         # handle protection expirations
         while True:
             # fetch expirations
