@@ -439,8 +439,8 @@ class ProtectionManager:
                     if detail_expiry == float('inf'):
                         continue
 
-                    # skip stale expirations
-                    if detail_expiry < (datetime.now() - RECENT_INTERVAL).timestamp():
+                    # skip stale expirations unless backtesting
+                    if not self.backtest and detail_expiry < time.time() - RECENT_INTERVAL.total_seconds():
                         logging.debug(f"stale expiration: {title} | {detail_expiry}")
                         continue
 
