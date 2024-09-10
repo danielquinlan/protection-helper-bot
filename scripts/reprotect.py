@@ -645,6 +645,7 @@ class ProtectionManager:
         # normal operation
         if not self.backtest:
             current_protection = page.protection()
+            logging.info(f"current protection: {expired_title} | protection: {current_protection}")
             if 'edit' in current_protection:
                 restore_edit_level, restore_edit_expiry = current_protection['edit']
             if 'move' in current_protection:
@@ -653,8 +654,14 @@ class ProtectionManager:
             try:
                 if isinstance(restore_edit_expiry, str) and restore_edit_expiry[0].isdigit():
                     restore_edit_expiry = ProtectionFunctions.iso_to_timestamp(restore_edit_expiry)
+                    if restore_edit_expiry < time.time():
+                        logging.warning(f"current edit expiry is overdue: {restore_edit_expiry}")
+                        restore_edit_level, restore_edit_expiry = None
                 if isinstance(restore_move_expiry, str) and restore_move_expiry[0].isdigit():
                     restore_move_expiry = ProtectionFunctions.iso_to_timestamp(restore_move_expiry)
+                    if restore_move_expiry < time.time():
+                        logging.warning(f"current move expiry is overdue: {restore_move_expiry}")
+                        restore_move_level, restore_move_expiry = None
             except Exception as e:
                 logging.error(f"skipping due to error converting protection timestamps: {current_protection} | {e}")
                 return False
@@ -671,14 +678,17 @@ class ProtectionManager:
             return False
 
         # restoration logic
-        if previous_edit_level and ProtectionFunctions.protection_level(previous_edit_level) < ProtectionFunctions.protection_level(edit_level) and previous_edit_expiry > edit_expiry and previous_edit_expiry > time.time() + 3600:
+        current_time = int(time.time())
+        logging.info(f"{expired_title} | edit values: previous_edit_level = {previous_edit_level}, edit_level = {edit_level}, previous_edit_expiry = {previous_edit_expiry}, edit_expiry = {edit_expiry}, current_time = {current_time}, restore_edit_level = {restore_edit_level}, restore_edit_expiry = {restore_edit_expiry}")
+        logging.info(f"{expired_title} | move values: previous_move_level = {previous_move_level}, move_level = {move_level}, previous_move_expiry = {previous_move_expiry}, move_expiry = {move_expiry}, current_time = {current_time}, restore_move_level = {restore_move_level}, restore_move_expiry = {restore_move_expiry}")
+        if previous_edit_level and ProtectionFunctions.protection_level(previous_edit_level) < ProtectionFunctions.protection_level(edit_level) and previous_edit_expiry > edit_expiry and previous_edit_expiry > current_time + 3600:
             restore_edit_level = previous_edit_level
             restore_edit_expiry = previous_edit_expiry
-            if previous_move_level and previous_move_expiry > move_expiry and previous_move_expiry > time.time() + 3600 and previous_move_level != "autoconfirmed":
+            if previous_move_level and previous_move_expiry > move_expiry and previous_move_expiry > current_time + 3600 and previous_move_level != "autoconfirmed":
                 restore_move_level = previous_move_level
                 restore_move_expiry = previous_move_expiry
             reprotect = True
-        elif previous_move_level and ProtectionFunctions.protection_level(previous_move_level) < ProtectionFunctions.protection_level(move_level) and previous_move_expiry > move_expiry and previous_move_expiry > time.time() + 3600 and previous_move_level != "autoconfirmed" and restore_move_level != "autoconfirmed":
+        elif previous_move_level and ProtectionFunctions.protection_level(previous_move_level) < ProtectionFunctions.protection_level(move_level) and previous_move_expiry > move_expiry and previous_move_expiry > current_time + 3600 and previous_move_level != "autoconfirmed" and restore_move_level != "autoconfirmed":
             restore_move_level = previous_move_level
             restore_move_expiry = previous_move_expiry
             reprotect = True
