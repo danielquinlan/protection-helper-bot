@@ -116,6 +116,7 @@ class ProtectionFunctions:
     """
     Utility class for general functions used across protection-related classes.
     """
+    levels = {'autoconfirmed': 0, 'extendedconfirmed': 1, 'templateeditor': 2, 'sysop': 3}
 
     @staticmethod
     def iso_to_timestamp(iso_string):
@@ -148,9 +149,7 @@ class ProtectionFunctions:
         Notes:
         Verified for English Wikipedia only.
         """
-        levels = {'autoconfirmed': 0, 'extendedconfirmed': 1, 'templateeditor': 2, 'sysop': 3}
-
-        return levels.get(level, -1)
+        return ProtectionFunctions.levels.get(level, -1)
 
 
 class ProtectionLogs:
