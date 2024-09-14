@@ -741,16 +741,7 @@ class ProtectionManager:
         logging.info(f"skipping due to conditions being unmet: {expired_title}");
         return False
 
-
-if __name__ == "__main__":
-    try:
-        args = parse_args()
-        site = login()
-        manager = ProtectionManager(site, backtest=args.backtest, future_days=args.future)
-
-        # log various options for debugging
-        logging.info(f"starting: DRY_RUN={DRY_RUN} | LOOKBACK_INTERVAL={LOOKBACK_INTERVAL} | RECENT_INTERVAL={RECENT_INTERVAL} | args={args}")
-
+    def process_expirations(self):
         # handle protection expirations
         while True:
             # fetch expirations
@@ -758,6 +749,16 @@ if __name__ == "__main__":
             # process all available expirations
             while expired := manager.find_next_expired_protection():
                 manager.evaluate_protection_restoration(expired)
+
+
+if __name__ == "__main__":
+    try:
+        args = parse_args()
+        site = login()
+        manager = ProtectionManager(site, backtest=args.backtest, future_days=args.future)
+
+        logging.info(f"starting: DRY_RUN={DRY_RUN} | LOOKBACK_INTERVAL={LOOKBACK_INTERVAL} | RECENT_INTERVAL={RECENT_INTERVAL} | args={args}")
+        manager.process_expirations()
     except Exception as e:
         logging.error(f"unhandled exception: {e}")
         time.sleep(300)
