@@ -86,6 +86,32 @@ def login():
         sys.exit(1)
 
 
+class RateLimit:
+    """
+    Rate limit actions to ensure a minimum delay between actions.
+    """
+
+    def __init__(self, delay: timedelta):
+        """
+        Initialize rate limiter.
+
+        Parameters:
+        delay (timedelta): Minimum time between actions.
+        """
+        self.delay = delay
+        self.last = datetime.now() - self.delay
+
+    def throttle(self):
+        """
+        Enforce the rate limit by sleeping if necessary.
+        """
+        elapsed_time = datetime.now() - self.last
+        sleep_time = max(0, (self.delay - elapsed_time).total_seconds())
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        self.last = datetime.now()
+
+
 class ProtectionFunctions:
     """
     Utility class for general functions used across protection-related classes.
@@ -391,6 +417,8 @@ class ProtectionManager:
         self.backtest = backtest
         self.future_time = timedelta(days=future_days).total_seconds()
         self.logs = ProtectionLogs(site)
+        self.protect_rate_limit = RateLimit(timedelta(minutes=60))
+        self.update_rate_limit = RateLimit(timedelta(minutes=5))
         self.page_protections = {}
 
     def update_page_protections(self):
@@ -400,6 +428,10 @@ class ProtectionManager:
         This method processes each log entry, handles unprotection, move protection, and updates
         the list of pages with active protections based on their expiration timestamps.
         """
+        # rate limit queries
+        self.update_rate_limit.throttle()
+
+        # update page protections
         count = 0
         for log, details in self.logs.fetch_all_logs():
             count += 1
@@ -701,6 +733,7 @@ class ProtectionManager:
                 expired_expiry = datetime.utcfromtimestamp(protection_expiry)
             logging.info(f"protecting: {expired_title} | expired: {expired_expiry} | levels: {protections} | expiry: {expiry} | reason: {reason}")
             if not DRY_RUN:
+                self.protect_rate_limit.throttle()
                 self.site.protect(page, protections, reason, expiry=expiry)
             return True
 
@@ -724,14 +757,7 @@ if __name__ == "__main__":
             manager.update_page_protections()
             # process all available expirations
             while expired := manager.find_next_expired_protection():
-                if manager.evaluate_protection_restoration(expired):
-                    # longer wait between reprotection actions
-                    time.sleep(0 if DRY_RUN else 300)
-                else:
-                    # shorter wait otherwise
-                    time.sleep(0 if DRY_RUN else 1)
-            # wait before checking log again
-            time.sleep(300)
+                manager.evaluate_protection_restoration(expired)
     except Exception as e:
         logging.error(f"unhandled exception: {e}")
         time.sleep(300)
