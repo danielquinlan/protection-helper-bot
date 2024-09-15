@@ -13,11 +13,12 @@ Functionality:
 
 No reprotection action is taken in the following cases:
 - The duration of the higher protection level extends beyond the prior protection's expiration.
-- The protection level is the same as or lower than the previous level.
+- The expiring protection level is not higher than the previous protection level.
 - There is a more recent protection action.
 - Any of the most recent actions is a cascading protection.
 - The protection would require differing edit and move expirations (not supported by pywikibot).
-- Serious errors occur during the restoration process.
+- A serious error occurs during the restoration process.
+- The restored protection would be shorter than MINIMUM_DURATION (default: 1 day).
 
 Non-standard dependencies:
 - pywikibot: For interacting with MediaWiki.
@@ -38,6 +39,7 @@ from datetime import datetime, timedelta
 # configuration
 LOOKBACK_INTERVAL = timedelta(days=366) # log period to review
 RECENT_INTERVAL = timedelta(days=90) # act on protections that have expired within this period
+MINIMUM_DURATION = timedelta(days=1) # minimum duration required for reprotection
 DRY_RUN = os.getenv('REPROTECT_DRY_RUN', 'true').lower() != 'false' # no actions by default
 
 
@@ -165,7 +167,8 @@ class ProtectionLogs:
         site (pywikibot.Site): The site from which to retrieve logs.
         """
         self.site = site
-        self.next_fetch_time = datetime.now() - LOOKBACK_INTERVAL
+        self.position = datetime.now() - LOOKBACK_INTERVAL
+        self.queries = 0
 
     def fetch_all_logs(self):
         """
@@ -174,14 +177,14 @@ class ProtectionLogs:
         Yields:
         tuple: A tuple containing log data and details.
         """
+        start = self.position
         end = datetime.now()
-        start = self.next_fetch_time
-        self.next_fetch_time = end
+        self.position = end
         logging.info(f"query {start} to {end}")
-        for log in self.site.logevents(logtype='protect', end=end, start=start, reverse=True):
-            log_result = self.parse_log(log)
-            if log_result:
+        for log in self.site.logevents(logtype='protect', start=start, end=end, reverse=True):
+            if log_result := self.parse_log(log):
                 yield log_result
+        self.queries += 1
         return
 
     def fetch_page_logs(self, page=None, before=None):
@@ -414,7 +417,8 @@ class ProtectionManager:
         """
         self.site = site
         self.backtest = backtest
-        self.future_time = timedelta(days=future_days).total_seconds()
+        self.backtest_time = None
+        self.future_seconds = timedelta(days=future_days).total_seconds()
         self.logs = ProtectionLogs(site)
         self.protect_rate_limit = RateLimit(timedelta(minutes=60))
         self.update_rate_limit = RateLimit(timedelta(minutes=5))
@@ -435,6 +439,14 @@ class ProtectionManager:
         for log, details in self.logs.fetch_all_logs():
             count += 1
             title = log['title']
+
+            # backtests
+            if self.backtest:
+                # simulated current time
+                self.backtest_time = ProtectionFunctions.iso_to_timestamp(log['timestamp'])
+                # process all available expirations
+                while expired := manager.find_next_expired_protection():
+                    manager.evaluate_protection_restoration(expired)
 
             # unprotection
             if log['action'] == 'unprotect':
@@ -470,11 +482,6 @@ class ProtectionManager:
                     if detail_expiry == float('inf'):
                         continue
 
-                    # skip stale expirations unless backtesting
-                    if not self.backtest and detail_expiry < time.time() - RECENT_INTERVAL.total_seconds():
-                        logging.debug(f"stale expiration: {title} | {detail_expiry}")
-                        continue
-
                     # only process high protection levels
                     detail_level = detail.get('level', None)
                     if detail_level in ['extendedconfirmed', 'templateeditor', 'sysop']:
@@ -489,7 +496,8 @@ class ProtectionManager:
                     continue
                 # store expirations
                 if filtered_details:
-                    self.page_protections[title] = (log['logid'], filtered_details)
+                    primary_expiry = self.get_primary_expiry_from_details(filtered_details)
+                    self.page_protections[title] = (log['logid'], primary_expiry, filtered_details)
             except Exception as e:
                 logging.error(f"error processing log entry for {log}: {e}")
 
@@ -531,22 +539,22 @@ class ProtectionManager:
         Returns:
         str: Title of the page with the oldest expired protection, or None if no such page exists.
         """
-        oldest_expiry = float('inf')
-        oldest_page = None
+        if not self.page_protections:
+            return None
 
-        for title, (logid, protections) in self.page_protections.items():
-            expiry = self.get_primary_expiry_from_details(protections)
-            # this should never happen
-            if expiry is None or expiry == float('inf'):
-                logging.error(f"invalid primary expiration: {title} | {logid} | {protections}")
-                continue
-            # expire based on the edit timestamp if there are two different timestamps
-            if expiry < oldest_expiry and expiry < time.time() + self.future_time:
-                oldest_expiry = expiry
-                oldest_page = title
+        oldest_page = min(self.page_protections, key=lambda k: self.page_protections[k][1])
 
-        logging.info(f"oldest: {oldest_page} {oldest_expiry} {self.page_protections.get(oldest_page)}")
-        return oldest_page
+        current_time = int(time.time())
+        if self.backtest:
+            current_time = self.backtest_time
+        if self.future_seconds and self.logs.queries:
+            current_time = int(time.time()) + self.future_seconds
+
+        if self.page_protections[oldest_page][1] < current_time:
+            logging.info(f"oldest: title = {oldest_page}, current_time = {current_time}, position = {self.logs.position}, protections = {self.page_protections[oldest_page]}")
+            return oldest_page
+
+        return None
 
     def evaluate_protection_restoration(self, expired_title):
         """
@@ -561,141 +569,136 @@ class ProtectionManager:
         Returns:
         bool: True if protection restored, False otherwise.
         """
-        expired_logid, protections = self.page_protections.pop(expired_title)
-        page = pywikibot.Page(self.site, expired_title)
-        protection_expiry = self.get_primary_expiry_from_details(protections)
+
+        def unpack_protections(protections):
+            protection_dict = {p['type']: (p.get('level'), p.get('expiry')) for p in protections}
+            return (
+                *protection_dict.get('edit', (None, None)),
+                *protection_dict.get('move', (None, None))
+            )
+
+        expired_logid, protection_expiry, protections = self.page_protections.pop(expired_title)
+
+        # current time
+        current_time = int(time.time())
+        if self.backtest:
+            current_time = self.backtest_time
+        if self.future_seconds and self.logs.queries:
+            current_time = protection_expiry
+
+        # clearly stale expirations
+        most_recent_expiry = max(detail['expiry'] for detail in protections)
+        if most_recent_expiry < current_time - RECENT_INTERVAL.total_seconds() and current_time != protection_expiry:
+            logging.info(f"stale expiration: {expired_title} | {protections}")
+            return False
 
         # deleted pages
+        page = pywikibot.Page(self.site, expired_title)
         if not page.exists():
             logging.info(f"skipping due to page not existing: {expired_title}")
             return False
 
-        edit_level = None
-        edit_expiry = None
-        move_level = None
-        move_expiry = None
+        # latest protection
+        latest_user = None
+        latest_timestamp = None
+        latest_edit_level = None
+        latest_edit_expiry = None
+        latest_move_level = None
+        latest_move_expiry = None
+
+        # ignore short-lived protections
+        short_lived = 0
+
+        # previous protection
+        previous_user = None
+        previous_comment = None
         previous_edit_level = None
         previous_edit_expiry = None
         previous_move_level = None
         previous_move_expiry = None
 
-        index = -1
-        found_expired_logid = False
-        user = None
-
+        # iterate across protection logs
+        log_position = 0
         for log, details in self.logs.fetch_page_logs(page=page):
             logid = log['logid']
             title = log['title']
             action = log['action']
+            timestamp = ProtectionFunctions.iso_to_timestamp(log['timestamp'])
 
             # backtest: ignore logs after a hypothetical restoration; this is an approximation
             if self.backtest and logid > expired_logid:
-                timestamp = ProtectionFunctions.iso_to_timestamp(log['timestamp'])
                 if isinstance(protection_expiry, (int, float)) and timestamp > protection_expiry:
                     logging.info(f"backtest ignoring subsequent protection: {expired_title} | {log} | {details}")
                     continue
 
-            # start index at 0
-            index += 1
+            # ignore transient protections by same user
+            if latest_user is not None and latest_user == log['user'] and latest_timestamp - timestamp < 900 and short_lived < 2 and action in ['modify', 'protect']:
+                logging.info(f"ignoring short-lived protection by same user: {expired_title} | {log} | {details}")
+                short_lived += 1
+                continue
 
-            # make sure we see the expired logid
-            if logid == expired_logid:
-                found_expired_logid = True
-
-            # checking top two logs should be sufficient
-            if index > 1:
-                break
-            logging.debug(f"log {index} | {logid} | {action} | {details}")
+            # shared checks
+            if action not in ['modify', 'protect']:
+                logging.info(f"skipping due to previous non-protection: {action} | {expired_title} | {log}")
+                return False
+            if not details:
+                logging.error(f"skipping due to no details: {expired_title} | {log}")
+                return False
+            if any('cascade' in p for p in details):
+                logging.info(f"skipping due to cascading protection: {action} | {expired_title} | {details} | {log}")
+                return False
 
             try:
-                if index == 0:
+                if log_position == 0:
+                    log_position += 1
                     if logid != expired_logid:
                         logging.info(f"skipping due to more recent protection: {expired_title}")
                         return False
-                    if not details:
-                        logging.error(f"skipping due to no details for expired protection: {expired_title}")
-                        return False
-                    if self.site.username() == log['user']:
+                    if log['user'] == self.site.username():
                         logging.warning(f"skipping due to most recent protection from self: {expired_title}")
                         return False
-                    for detail in details:
-                        detail_type = detail.get('type', None)
-                        detail_level = detail.get('level', None)
-                        detail_expiry = detail.get('expiry', None)
-                        if detail_type == 'edit':
-                            edit_level = detail_level
-                            edit_expiry = detail_expiry
-                        if detail_type == 'move':
-                            move_level = detail_level
-                            move_expiry = detail_expiry
-                        if 'cascade' in detail:
-                            logging.info(f"skipping due to cascading protection: {action} | {expired_title} | {details} | {log}")
-                            return False
-                elif index == 1:
-                    if action not in ['modify', 'protect']:
-                        logging.info(f"skipping due to previous non-protection: {action} | {expired_title} | {log}")
-                        return False
-                    if not details:
-                        logging.error(f"skipping due to no details for previous protection: {expired_title}")
-                        return False
-
-                    # details for the reason
-                    user = log['user']
-                    comment = log['comment']
-
-                    for detail in details:
-                        detail_type = detail.get('type', None)
-                        detail_level = detail.get('level', None)
-                        detail_expiry = detail.get('expiry', None)
-                        if detail_type == 'edit':
-                            previous_edit_level = detail_level
-                            previous_edit_expiry = detail_expiry
-                        if detail_type == 'move':
-                            previous_move_level = detail_level
-                            previous_move_expiry = detail_expiry
-                        if 'cascade' in detail:
-                            logging.info(f"skipping due to cascading protection: {action} | {expired_title} | {details} | {log}")
-                            return False
+                    latest_timestamp = timestamp
+                    latest_user = log['user']
+                    ( latest_edit_level, latest_edit_expiry,
+                      latest_move_level, latest_move_expiry ) = unpack_protections(details)
+                    continue
+                elif log_position == 1:
+                    log_position += 1
+                    previous_user = log['user']
+                    previous_comment = log['comment']
+                    ( previous_edit_level, previous_edit_expiry,
+                      previous_move_level, previous_move_expiry ) = unpack_protections(details)
+                    break
             except Exception as e:
                 logging.error(f"error processing log entry for {log}: {e}")
 
-        # final decision on restoring protection
-        if not user:
+        # nothing to restore
+        if not previous_user:
             logging.info(f"skipping due to no previous protection: {action} | {expired_title} | {details} | {log}")
             return False
-        if not comment:
-            comment = "empty reason"
-        reprotect = False
 
         # current protection levels
         restore_edit_level = None
         restore_edit_expiry = None
         restore_move_level = None
         restore_move_expiry = None
-        current_time = int(time.time())
-        if self.backtest or self.future_time:
-            current_time = protection_expiry
-        if edit_expiry is not None and edit_expiry > current_time:
-            restore_edit_level, restore_edit_expiry = edit_level, edit_expiry
-        if move_expiry is not None and move_expiry > current_time:
-            restore_move_level, restore_move_expiry = move_level, move_expiry
-
-        # should never happen
-        if not found_expired_logid:
-            logging.error(f"skipping due to missing expired logid: {expired_logid} | {expired_title}");
-            return False
+        if latest_edit_expiry is not None and latest_edit_expiry > current_time:
+            restore_edit_level, restore_edit_expiry = latest_edit_level, latest_edit_expiry
+        if latest_move_expiry is not None and latest_move_expiry > current_time:
+            restore_move_level, restore_move_expiry = latest_move_level, latest_move_expiry
 
         # restoration logic
-        logging.info(f"{expired_title} | edit values: previous_edit_level = {previous_edit_level}, edit_level = {edit_level}, previous_edit_expiry = {previous_edit_expiry}, edit_expiry = {edit_expiry}, current_time = {current_time}, restore_edit_level = {restore_edit_level}, restore_edit_expiry = {restore_edit_expiry}")
-        logging.info(f"{expired_title} | move values: previous_move_level = {previous_move_level}, move_level = {move_level}, previous_move_expiry = {previous_move_expiry}, move_expiry = {move_expiry}, current_time = {current_time}, restore_move_level = {restore_move_level}, restore_move_expiry = {restore_move_expiry}")
-        if previous_edit_level and ProtectionFunctions.protection_level(previous_edit_level) < ProtectionFunctions.protection_level(edit_level) and previous_edit_expiry > edit_expiry and previous_edit_expiry > current_time + 3600:
+        reprotect = False
+        logging.info(f"{expired_title} | edit values: previous_edit_level = {previous_edit_level}, latest_edit_level = {latest_edit_level}, previous_edit_expiry = {previous_edit_expiry}, latest_edit_expiry = {latest_edit_expiry}, current_time = {current_time}, restore_edit_level = {restore_edit_level}, restore_edit_expiry = {restore_edit_expiry}")
+        logging.info(f"{expired_title} | move values: previous_move_level = {previous_move_level}, latest_move_level = {latest_move_level}, previous_move_expiry = {previous_move_expiry}, latest_move_expiry = {latest_move_expiry}, current_time = {current_time}, restore_move_level = {restore_move_level}, restore_move_expiry = {restore_move_expiry}")
+        if previous_edit_level and ProtectionFunctions.protection_level(previous_edit_level) < ProtectionFunctions.protection_level(latest_edit_level) and previous_edit_expiry > latest_edit_expiry and previous_edit_expiry > current_time + MINIMUM_DURATION.total_seconds():
             restore_edit_level = previous_edit_level
             restore_edit_expiry = previous_edit_expiry
-            if previous_move_level and previous_move_expiry > move_expiry and previous_move_expiry > current_time + 3600 and previous_move_level != "autoconfirmed":
+            if previous_move_level and previous_move_expiry > latest_move_expiry and previous_move_expiry > current_time + MINIMUM_DURATION.total_seconds() and previous_move_level != "autoconfirmed":
                 restore_move_level = previous_move_level
                 restore_move_expiry = previous_move_expiry
             reprotect = True
-        elif previous_move_level and ProtectionFunctions.protection_level(previous_move_level) < ProtectionFunctions.protection_level(move_level) and previous_move_expiry > move_expiry and previous_move_expiry > current_time + 3600 and previous_move_level != "autoconfirmed" and restore_move_level != "autoconfirmed":
+        elif previous_move_level and ProtectionFunctions.protection_level(previous_move_level) < ProtectionFunctions.protection_level(latest_move_level) and previous_move_expiry > latest_move_expiry and previous_move_expiry > current_time + MINIMUM_DURATION.total_seconds() and previous_move_level != "autoconfirmed" and restore_move_level != "autoconfirmed":
             restore_move_level = previous_move_level
             restore_move_expiry = previous_move_expiry
             reprotect = True
@@ -725,12 +728,14 @@ class ProtectionManager:
                 expiry = restore_edit_expiry
             elif restore_move_expiry:
                 expiry = restore_move_expiry
-            reason = f"Restoring protection by [[User:{user}|{user}]]: {comment}"
+            reason = f"Restoring protection by [[User:{previous_user}|{previous_user}]]"
+            if previous_comment:
+                reason += f": {previous_comment}"
             if protection_expiry == float('inf'):
                 expired_expiry = "indefinite"
             elif isinstance(protection_expiry, (int, float)):
                 expired_expiry = datetime.utcfromtimestamp(protection_expiry)
-            logging.info(f"protecting: {expired_title} | expired: {expired_expiry} | levels: {protections} | expiry: {expiry} | reason: {reason}")
+            logging.info(f"protecting: {expired_title} | expired: {expired_expiry} | levels: {protections} | expiry: {expiry} | reason: {reason} | short_lived: {short_lived}")
             if not DRY_RUN:
                 self.protect_rate_limit.throttle()
                 self.site.protect(page, protections, reason, expiry=expiry)
