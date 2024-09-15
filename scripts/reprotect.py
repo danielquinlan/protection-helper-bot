@@ -16,7 +16,6 @@ No reprotection action is taken in the following cases:
 - The expiring protection level is not higher than the previous protection level.
 - There is a more recent protection action.
 - Any of the most recent actions is a cascading protection.
-- The protection would require differing edit and move expirations (not supported by pywikibot).
 - A serious error occurs during the restoration process.
 - The restored protection would be shorter than MINIMUM_DURATION (default: 1 day).
 
@@ -37,7 +36,7 @@ from datetime import datetime, timedelta
 
 
 # configuration
-LOOKBACK_INTERVAL = timedelta(days=366) # log period to review
+LOOKBACK_INTERVAL = timedelta(days=731) # log period to review
 RECENT_INTERVAL = timedelta(days=90) # act on protections that have expired within this period
 MINIMUM_DURATION = timedelta(days=1) # minimum duration required for reprotection
 DRY_RUN = os.getenv('REPROTECT_DRY_RUN', 'true').lower() != 'false' # no actions by default
@@ -577,6 +576,16 @@ class ProtectionManager:
                 *protection_dict.get('move', (None, None))
             )
 
+        def format_expiry(expiry):
+            if expiry in ['infinity', 'infinite', 'indefinite', 'never', '', float('inf')]:
+                return 'indefinite'
+            elif isinstance(expiry, (int, float)):
+                dt = datetime.utcfromtimestamp(expiry)
+                iso_string = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                return iso_string
+            logging.warning(f"unexpected expiry value: {expiry}")
+            return str(expiry)
+
         expired_logid, protection_expiry, protections = self.page_protections.pop(expired_title)
 
         # current time
@@ -710,35 +719,30 @@ class ProtectionManager:
 
         # perform restoration
         if reprotect:
-            protections = {'edit': restore_edit_level, 'move': restore_move_level}
-            if restore_edit_expiry in ['infinity', 'infinite', 'indefinite', 'never', '', float('inf')]:
-                restore_edit_expiry = 'indefinite'
-            if restore_move_expiry in ['infinity', 'infinite', 'indefinite', 'never', '', float('inf')]:
-                restore_move_expiry = 'indefinite'
-            if restore_edit_expiry is not None and restore_move_expiry is not None:
-                if restore_edit_expiry != restore_move_expiry:
-                    logging.warning(f"skipping due to differing expiration timestamps: edit = {restore_edit_expiry}, move = {restore_move_expiry}")
-                    return False
-            expiry = None
-            if isinstance(restore_edit_expiry, (int, float)):
-                restore_edit_expiry = datetime.utcfromtimestamp(restore_edit_expiry)
-            if isinstance(restore_move_expiry, (int, float)):
-                restore_move_expiry = datetime.utcfromtimestamp(restore_move_expiry)
-            if restore_edit_expiry:
-                expiry = restore_edit_expiry
-            elif restore_move_expiry:
-                expiry = restore_move_expiry
+            protections = {}
+            expirys = []
+            # edit protection
+            if restore_edit_level:
+                protections['edit'] = restore_edit_level
+                expiry_string = format_expiry(restore_edit_expiry)
+                expirys.append(expiry_string)
+            # move protection
+            if restore_move_level:
+                protections['move'] = restore_move_level
+                expiry_string = format_expiry(restore_move_expiry)
+                if expiry_string not in expirys:
+                    expirys.append(expiry_string)
+            # expired protection expiry
+            protection_expiry = format_expiry(protection_expiry)
+            # reason
             reason = f"Restoring protection by [[User:{previous_user}|{previous_user}]]"
             if previous_comment:
                 reason += f": {previous_comment}"
-            if protection_expiry == float('inf'):
-                expired_expiry = "indefinite"
-            elif isinstance(protection_expiry, (int, float)):
-                expired_expiry = datetime.utcfromtimestamp(protection_expiry)
-            logging.info(f"protecting: {expired_title} | expired: {expired_expiry} | levels: {protections} | expiry: {expiry} | reason: {reason} | short_lived: {short_lived}")
+            # apply protection
+            logging.info(f"protecting: {expired_title} | expired: {protection_expiry} | levels: {protections} | expiry: {expirys} | reason: {reason} | short_lived: {short_lived}")
             if not DRY_RUN:
                 self.protect_rate_limit.throttle()
-                self.site.protect(page, protections, reason, expiry=expiry)
+                self.site.protect(page, protections, reason, expiry="|".join(expirys))
             return True
 
         # conditions not met
