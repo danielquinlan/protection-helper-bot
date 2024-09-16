@@ -610,6 +610,7 @@ class ProtectionManager:
         # latest protection
         latest_user = None
         latest_timestamp = None
+        latest_comment = None
         latest_edit_level = None
         latest_edit_expiry = None
         latest_move_level = None
@@ -641,7 +642,7 @@ class ProtectionManager:
                     continue
 
             # ignore transient protections by same user
-            if latest_user is not None and latest_user == log['user'] and latest_timestamp - timestamp < 900 and short_lived < 2 and action in ['modify', 'protect']:
+            if latest_user is not None and latest_user == log['user'] and latest_timestamp - timestamp < 900 and short_lived < 2 and action in ['modify', 'protect'] and not latest_comment.lower().startswith('temporary'):
                 logging.info(f"ignoring short-lived protection by same user: {expired_title} | {log} | {details}")
                 short_lived += 1
                 continue
@@ -666,8 +667,9 @@ class ProtectionManager:
                     if log['user'] == self.site.username():
                         logging.warning(f"skipping due to most recent protection from self: {expired_title}")
                         return False
-                    latest_timestamp = timestamp
                     latest_user = log['user']
+                    latest_timestamp = timestamp
+                    latest_comment = log['comment'] or ''
                     ( latest_edit_level, latest_edit_expiry,
                       latest_move_level, latest_move_expiry ) = unpack_protections(details)
                     continue
@@ -735,9 +737,12 @@ class ProtectionManager:
             # expired protection expiry
             protection_expiry = format_expiry(protection_expiry)
             # reason
-            reason = f"Restoring protection by [[User:{previous_user}|{previous_user}]]"
-            if previous_comment:
-                reason += f": {previous_comment}"
+            if previous_user == self.site.username():
+                reason = previous_comment
+            else:
+                reason = f"Restoring protection by [[User:{previous_user}|{previous_user}]]"
+                if previous_comment:
+                    reason += f": {previous_comment}"
             # apply protection
             logging.info(f"protecting: {expired_title} | expired: {protection_expiry} | levels: {protections} | expiry: {expirys} | reason: {reason} | short_lived: {short_lived}")
             if not DRY_RUN:
