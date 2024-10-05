@@ -31,6 +31,7 @@ import random
 import re
 import sys
 import time
+import traceback
 
 from datetime import datetime, timedelta
 
@@ -702,14 +703,14 @@ class ProtectionManager:
         reprotect = False
         logging.info(f"{expired_title} | edit values: previous_edit_level = {previous_edit_level}, latest_edit_level = {latest_edit_level}, previous_edit_expiry = {previous_edit_expiry}, latest_edit_expiry = {latest_edit_expiry}, current_time = {current_time}, restore_edit_level = {restore_edit_level}, restore_edit_expiry = {restore_edit_expiry}")
         logging.info(f"{expired_title} | move values: previous_move_level = {previous_move_level}, latest_move_level = {latest_move_level}, previous_move_expiry = {previous_move_expiry}, latest_move_expiry = {latest_move_expiry}, current_time = {current_time}, restore_move_level = {restore_move_level}, restore_move_expiry = {restore_move_expiry}")
-        if previous_edit_level and ProtectionFunctions.protection_level(previous_edit_level) < ProtectionFunctions.protection_level(latest_edit_level) and previous_edit_expiry > latest_edit_expiry and previous_edit_expiry > current_time + MINIMUM_DURATION.total_seconds():
+        if previous_edit_level and ProtectionFunctions.protection_level(previous_edit_level) < ProtectionFunctions.protection_level(latest_edit_level) and (latest_edit_expiry is None or previous_edit_expiry > latest_edit_expiry) and previous_edit_expiry > current_time + MINIMUM_DURATION.total_seconds():
             restore_edit_level = previous_edit_level
             restore_edit_expiry = previous_edit_expiry
-            if previous_move_level and previous_move_expiry > latest_move_expiry and previous_move_expiry > current_time + MINIMUM_DURATION.total_seconds() and previous_move_level != "autoconfirmed":
+            if previous_move_level and (latest_move_expiry is None or previous_move_expiry > latest_move_expiry) and previous_move_expiry > current_time + MINIMUM_DURATION.total_seconds() and previous_move_level != "autoconfirmed":
                 restore_move_level = previous_move_level
                 restore_move_expiry = previous_move_expiry
             reprotect = True
-        elif previous_move_level and ProtectionFunctions.protection_level(previous_move_level) < ProtectionFunctions.protection_level(latest_move_level) and previous_move_expiry > latest_move_expiry and previous_move_expiry > current_time + MINIMUM_DURATION.total_seconds() and previous_move_level != "autoconfirmed" and restore_move_level != "autoconfirmed":
+        elif previous_move_level and ProtectionFunctions.protection_level(previous_move_level) < ProtectionFunctions.protection_level(latest_move_level) and (latest_move_expiry is None or previous_move_expiry > latest_move_expiry) and previous_move_expiry > current_time + MINIMUM_DURATION.total_seconds() and previous_move_level != "autoconfirmed" and restore_move_level != "autoconfirmed":
             restore_move_level = previous_move_level
             restore_move_expiry = previous_move_expiry
             reprotect = True
@@ -774,5 +775,6 @@ if __name__ == "__main__":
         manager.process_expirations()
     except Exception as e:
         logging.error(f"unhandled exception: {e}")
+        logging.error(f"traceback: {traceback.format_exc()}")
         time.sleep(300)
         sys.exit(1)
