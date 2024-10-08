@@ -259,15 +259,22 @@ class ProtectionLogs:
             - 'type': The type of protection.
             - 'level': The protection level.
             - 'expiry': The expiry timestamp of the protection or float('inf') for indefinite.
-        None: If no details could be extracted, or the type of protection isn't 'edit' or 'move'.
+        None: If no details could be extracted.
         """
         level_map = {
             'Block new and unregistered users': 'autoconfirmed',
             'Block all non-admin users': 'sysop'
         }
         patterns = [
-            r'\[(?P<type>edit|move)=(?P<level>\w+)\] \((?P<expiry>expires[^\)]+\(UTC\)|indefinite)\)',
-            r'\[(?P<type>Edit|Move)=(?P<level>Block new and unregistered users|Block all non-admin users)\] \((?P<expiry>expires[^\)]+\(UTC\)|indefinite)\)'
+            r'\[(?P<type>create|edit|move|upload)=(?P<level>\w+)\] \((?P<expiry>expires[^\)]+\(UTC\)|indefinite)\)',
+            r'\[(?P<type>create)=(?P<level>\w+)\] {2}\((?P<expiry>expires[^\)]+\(UTC\)|indefinite)\)',
+            r'\[(?P<type>Create|Edit|Move|Upload)=(?P<level>Block new and unregistered users|Block all non-admin users)\] \((?P<expiry>expires[^\)]+\(UTC\)|indefinite)\)'
+        ]
+        date_formats = [
+            'expires %H:%M, %d %B %Y (UTC)',
+            'expires %H:%M, %B %d, %Y (UTC)',
+            'expires %Y-%m-%dT%H:%M:%S (UTC)',
+            'expires %H:%M, %Y %B %d (UTC)'
         ]
         details = []
 
@@ -277,7 +284,17 @@ class ProtectionLogs:
                 if expiry == 'indefinite':
                     expiry = float('inf')
                 else:
-                    expiry = datetime.strptime(expiry, 'expires %H:%M, %d %B %Y (UTC)').timestamp()
+                    type_of_protection = match.group('type').lower()
+                    max_date_formats = 4 if type_of_protection == 'create' else 1
+                    for i in range(max_date_formats):
+                        try:
+                            expiry = datetime.strptime(expiry, date_formats[i]).timestamp()
+                            break
+                        except ValueError:
+                            continue
+                    else:
+                        logging.error(f"error parsing expiry date: {description}")
+                        return None
 
                 level = match.group('level')
                 if level in level_map:
@@ -326,7 +343,7 @@ class ProtectionLogs:
             logging.error(f"error processing log: {e}")
             return None
 
-        # unprotection
+        # any unprotection
         action = log_data['action']
         if action == 'unprotect':
             return log_data, None
@@ -375,7 +392,7 @@ class ProtectionLogs:
                 logging.error(f"error parsing legacy log: {e} | {vars(log)}")
                 return None
 
-        # this is almost entirely legacy formatted create and upload protections
+        # log details are missing or improperly formatted
         if not isinstance(details, list):
             logging.warning(f"missing log details: {vars(log)}")
             return None
@@ -502,6 +519,10 @@ class ProtectionManager:
                 logging.error(f"error processing log entry for {log}: {e}")
 
         logging.info(f"total logs: {count}, expirations: {len(self.page_protections)}")
+
+        if self.backtest and count == 0:
+            logging.info("done backtest")
+            sys.exit(0)
 
     def get_primary_expiry_from_details(self, protections):
         """
