@@ -437,7 +437,7 @@ class ProtectionManager:
         self.backtest_time = None
         self.future_seconds = timedelta(days=future_days).total_seconds()
         self.logs = ProtectionLogs(site)
-        self.protect_rate_limit = RateLimit(timedelta(minutes=60))
+        self.protect_rate_limit = RateLimit(timedelta(minutes=10))
         self.update_rate_limit = RateLimit(timedelta(minutes=5))
         self.page_protections = {}
 
