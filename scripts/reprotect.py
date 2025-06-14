@@ -664,7 +664,7 @@ class ProtectionManager:
                     continue
 
             # ignore transient protections by same user
-            if latest_user is not None and latest_user == log['user'] and latest_timestamp - timestamp < 900 and short_lived < 2 and action in ['modify', 'protect'] and not latest_comment.lower().startswith('temporary'):
+            if latest_user is not None and latest_user == log['user'] and latest_timestamp - timestamp < 900 and short_lived < 5 and action in ['modify', 'protect'] and not latest_comment.lower().startswith('temporary'):
                 logging.info(f"ignoring short-lived protection by same user: {expired_title} | {log} | {details}")
                 short_lived += 1
                 continue
