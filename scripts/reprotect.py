@@ -38,7 +38,7 @@ from datetime import datetime, timedelta
 
 # configuration
 LOOKBACK_INTERVAL = timedelta(days=731) # log period to review
-RECENT_INTERVAL = timedelta(days=90) # act on protections that have expired within this period
+RECENT_INTERVAL = timedelta(days=30) # act on protections that have expired within this period
 MINIMUM_DURATION = timedelta(days=1) # minimum duration required for reprotection
 DRY_RUN = os.getenv('REPROTECT_DRY_RUN', 'true').lower() != 'false' # no actions by default
 
@@ -651,10 +651,14 @@ class ProtectionManager:
 
         # iterate across protection logs
         log_position = 0
+        timestamp = None
+        subsequent_timestamp = None
         for log, details in self.logs.fetch_page_logs(page=page):
             logid = log['logid']
             title = log['title']
             action = log['action']
+            if timestamp is not None:
+                subsequent_timestamp = timestamp
             timestamp = ProtectionFunctions.iso_to_timestamp(log['timestamp'])
 
             # backtest: ignore logs after a hypothetical restoration; this is an approximation
@@ -676,6 +680,14 @@ class ProtectionManager:
             if not details:
                 logging.error(f"skipping due to no details: {expired_title} | {log}")
                 return False
+
+            ( edit_level, edit_expiry, move_level, move_expiry ) = unpack_protections(details)
+
+            # ignore consecutive temporary edit protections at same level
+            if latest_user is not None and edit_level and edit_level == latest_edit_level and isinstance(edit_expiry, (int, float)) and edit_expiry != float('inf') and edit_expiry > subsequent_timestamp:
+                logging.info(f"ignoring consecutive temporary edit protection at same level: {expired_title} | {log} | {details}")
+                continue
+
             if any('cascade' in p for p in details):
                 logging.info(f"skipping due to cascading protection: {action} | {expired_title} | {details} | {log}")
                 return False
@@ -692,15 +704,13 @@ class ProtectionManager:
                     latest_user = log['user']
                     latest_timestamp = timestamp
                     latest_comment = log['comment'] or ''
-                    ( latest_edit_level, latest_edit_expiry,
-                      latest_move_level, latest_move_expiry ) = unpack_protections(details)
+                    latest_edit_level, latest_edit_expiry, latest_move_level, latest_move_expiry = edit_level, edit_expiry, move_level, move_expiry
                     continue
                 elif log_position == 1:
                     log_position += 1
                     previous_user = log['user']
                     previous_comment = log['comment']
-                    ( previous_edit_level, previous_edit_expiry,
-                      previous_move_level, previous_move_expiry ) = unpack_protections(details)
+                    previous_edit_level, previous_edit_expiry, previous_move_level, previous_move_expiry = edit_level, edit_expiry, move_level, move_expiry
                     break
             except Exception as e:
                 logging.error(f"error processing log entry for {log}: {e}")
