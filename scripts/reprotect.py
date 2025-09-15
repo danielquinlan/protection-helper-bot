@@ -103,12 +103,14 @@ class RateLimit:
         self.delay = delay
         self.last = datetime.now() - self.delay
 
-    def throttle(self):
+    def throttle(self, probe=False):
         """
         Enforce the rate limit by sleeping if necessary.
         """
         elapsed_time = datetime.now() - self.last
         sleep_time = max(0, (self.delay - elapsed_time).total_seconds())
+        if probe:
+            return sleep_time > 0
         if sleep_time > 0:
             time.sleep(sleep_time)
         self.last = datetime.now()
@@ -437,8 +439,9 @@ class ProtectionManager:
         self.backtest_time = None
         self.future_seconds = timedelta(days=future_days).total_seconds()
         self.logs = ProtectionLogs(site)
-        self.protect_rate_limit = RateLimit(timedelta(minutes=10))
-        self.update_rate_limit = RateLimit(timedelta(minutes=5))
+        self.protect_rate_limit = RateLimit(timedelta(minutes=5))
+        self.update_rate_limit = RateLimit(timedelta(minutes=10))
+        self.find_rate_limit = RateLimit(timedelta(minutes=5))
         self.page_protections = {}
 
     def update_page_protections(self):
@@ -555,12 +558,12 @@ class ProtectionManager:
         Finds the page with the oldest expired protection.
 
         Scans through all pages to determine the earliest protection expiration timestamp.
-        Logs a warning if there are multiple expiry timestamps for a page.
 
         Returns:
         str: Title of the page with the oldest expired protection, or None if no such page exists.
         """
         if not self.page_protections:
+            self.find_rate_limit.throttle()
             return None
 
         oldest_page = min(self.page_protections, key=lambda k: self.page_protections[k][1])
@@ -571,10 +574,19 @@ class ProtectionManager:
         if self.future_seconds and self.logs.queries:
             current_time = int(time.time()) + self.future_seconds
 
-        if self.page_protections[oldest_page][1] < current_time:
+        time_until_expiry = self.page_protections[oldest_page][1] - current_time
+        waited = False
+        if 0 < time_until_expiry < self.find_rate_limit.delay.total_seconds():
+            logging.info(f"sleeping {time_until_expiry:.2f} seconds until protection expires: {oldest_page}")
+            time.sleep(time_until_expiry)
+            current_time = int(time.time())
+            waited = True
+
+        if waited or time_until_expiry <= 0:
             logging.info(f"oldest: title = {oldest_page}, current_time = {current_time}, position = {self.logs.position}, protections = {self.page_protections[oldest_page]}")
             return oldest_page
 
+        self.find_rate_limit.throttle()
         return None
 
     def evaluate_protection_restoration(self, expired_title):
@@ -790,10 +802,11 @@ class ProtectionManager:
         # handle protection expirations
         while True:
             # fetch expirations
-            manager.update_page_protections()
+            if not self.update_rate_limit.throttle(probe=True):
+                self.update_page_protections()
             # process all available expirations
-            while expired := manager.find_next_expired_protection():
-                manager.evaluate_protection_restoration(expired)
+            while expired := self.find_next_expired_protection():
+                self.evaluate_protection_restoration(expired)
 
 
 if __name__ == "__main__":
